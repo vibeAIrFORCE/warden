@@ -8,6 +8,7 @@ else (a Telegram channel, an on-chain feed, your own model's outputs).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -20,40 +21,89 @@ class SignalProvider(Protocol):
     def latest(self) -> Sequence[Signal]: ...
 
 
-class VibeSignalProvider:
-    """The default feed — VIBE's public delivered-signals history.
+class SignalsUnavailable(RuntimeError):
+    """The priced signal feed is honestly unavailable to THIS caller.
 
-    Our smart-money aggregation pipeline scores wallets across chains and
-    delivers a curated signal book; this provider reads its PUBLIC history
-    endpoint (no key, anonymous). The agent follows the book's own recorded
-    entry price — same entry as the book, never the current mark.
+    Raised ONLY for payment/auth-supply failures the caller can act on:
+    HTTP 402 (insufficient credits or an x402 payment challenge) and
+    HTTP 429 (trial budget exhausted). Every other failure — invalid key,
+    upstream 5xx, timeout, undecodable JSON — propagates unchanged; the
+    provider NEVER converts a failure into a silent empty book ([] is
+    returned only on HTTP 200 with zero open deliveries).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class VibeSignalProvider:
+    """The default feed — VIBE's priced delivered-signals SKU.
+
+    Reads GET {base_url}/x402/alpha/jev/deliveries — perps TG-signal
+    delivery lifecycles with the binding entry_price the agent follows.
+    Credential tri-state: VIBE_API_KEY env (or api_key=) wins and is sent
+    as `x-api-key`; else VIBE_TRIAL_TOKEN env (or trial_token=) is sent as
+    `Authorization: Bearer <token>`; else the request is keyless (the
+    endpoint answers with its x402 payment challenge). The agent follows
+    the book's own recorded entry price — same entry as the book, never
+    the current mark.
     """
 
     def __init__(
         self,
         base_url: str = "https://api.vibe.airforce/api",
+        api_key: str | None = None,
+        trial_token: str | None = None,
         http: httpx.AsyncClient | None = None,
         limit: int = 25,
     ) -> None:
         self._base = base_url.rstrip("/")
+        self._api_key = api_key if api_key is not None else os.getenv("VIBE_API_KEY")
+        self._trial = trial_token if trial_token is not None else os.getenv("VIBE_TRIAL_TOKEN")
         self._http = http
         self._limit = limit
+
+    def _headers(self) -> dict[str, str]:
+        """Credential tri-state: key lane wins, then trial, else keyless."""
+        if self._api_key:
+            return {"x-api-key": self._api_key}
+        if self._trial:
+            return {"Authorization": f"Bearer {self._trial}"}
+        return {}
 
     async def latest(self) -> Sequence[Signal]:
         own = self._http is None
         http = self._http or httpx.AsyncClient(timeout=15.0)
         try:
             res = await http.get(
-                f"{self._base}/top-picks/signals/history",
-                params={"limit": self._limit},
+                f"{self._base}/x402/alpha/jev/deliveries",
+                params={"status": "open", "limit": self._limit},
+                headers=self._headers(),
             )
+            if res.status_code in (402, 429):
+                # Honest-unavailable: the caller's payment/credential supply
+                # failed (INSUFFICIENT_CREDITS envelope, x402 payment
+                # challenge, or exhausted trial budget). NEVER fake-empty.
+                raise SignalsUnavailable(reason=f"http_{res.status_code}")
             res.raise_for_status()
-            rows = res.json().get("signals") or res.json().get("rows") or []
+            body = res.json()
+            rows = (
+                (body.get("data") or {}).get("deliveries")
+                if isinstance(body.get("data"), dict)
+                else body.get("data")
+            ) or []
+            if not isinstance(rows, list):
+                rows = []
         finally:
             if own:
                 await http.aclose()
         out: list[Signal] = []
+        candidates = 0  # rows that SURVIVE the exited_at skip (open candidates)
         for r in rows:
+            if not isinstance(r, dict) or r.get("exited_at"):
+                continue  # SKIP any row with exited_at set
+            candidates += 1
             side = str(r.get("side") or "").strip().upper()
             if side not in ("LONG", "SHORT"):
                 continue
@@ -64,10 +114,17 @@ class VibeSignalProvider:
                     side=side,  # type: ignore[arg-type]
                     entry_price=_f(r.get("entry_price")),
                     conviction=_f(r.get("conviction")),
-                    meta={"source": "vibe"},
+                    meta={
+                        "source": "vibe",
+                        "payment_mode": ((body.get("meta") or {}).get("payment_mode")
+                                         if isinstance(body.get("meta"), dict) else None),
+                    },
                 )
             )
-        return [s for s in out if s.signal_id and s.coin]
+        out = [s for s in out if s.signal_id and s.coin]
+        if candidates and not out:
+            raise SignalsUnavailable(reason="parse_dropped_all_rows")
+        return out
 
 
 class FileSignalProvider:
