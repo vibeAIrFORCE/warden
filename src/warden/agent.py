@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .brain import BrainAdapter, HeuristicBrain
+from .assets import AssetUnresolved
+from .brain import BrainAdapter, HeuristicBrain, NearBrain, NearBrainUnavailable
 from .executor import HyperliquidExecutor
 from .ledger import JsonlLedger
 from .policy import PolicyWallet
@@ -51,8 +52,27 @@ class Agent:
                 # allMids; dry mode uses the signal's own recorded basis —
                 # the honest mirror-the-book entry.
                 mark = signal.entry_price or 0.0
+                try:
+                    meta = await self.executor.resolve_asset(signal.coin)
+                except AssetUnresolved:
+                    # Fail closed in dry runs too: an unresolvable coin
+                    # never becomes an action (the silent-asset-0 class is
+                    # dead everywhere). The row still records — a skipped
+                    # signal_id is not retried — and the brain's decision
+                    # reason keeps its own key; the asset failure names
+                    # itself in exec_reason.
+                    self.ledger.record({
+                        "signal_id": signal.signal_id, "coin": signal.coin,
+                        "side": signal.side, "decision": decision.follow,
+                        "reason": decision.reason,
+                        "admitted": verdict.allowed,
+                        "admit_reason": verdict.reason, "executed": False,
+                        "dry": _dry(), "exec_reason": "asset_unresolved",
+                    })
+                    outcomes.append({"signal": signal, "verdict": verdict})
+                    continue
                 action = self.executor.build_open(
-                    signal.coin, asset=0, side=signal.side,
+                    signal.coin, asset=meta.asset, side=signal.side,
                     size=verdict.effective_size_usd or 0.0, mark=mark,
                     leverage=verdict.effective_leverage,
                 )
@@ -91,10 +111,21 @@ async def _main() -> None:
     ap.add_argument("--poll", type=int, default=POLL_SECONDS)
     args = ap.parse_args()
 
+    # Construction-time brain selection ONLY: the remote veto brain first
+    # (NearBrain, configured via WARDEN_BRAIN_URL), falling back to the
+    # heuristic when no endpoint is configured. A NearBrain runtime failure
+    # refuses that one signal — the brain never swaps mid-flight, which
+    # would mask outages and break the ledger's decision.source honesty.
+    # --min-conviction stays HeuristicBrain-only: NearBrain's confidence
+    # mechanism is the parsed probability margin, not a conviction floor.
+    try:
+        brain: BrainAdapter = NearBrain(size_usd=args.size)
+    except NearBrainUnavailable:
+        brain = HeuristicBrain(min_conviction=args.min_conviction,
+                               size_usd=args.size)
     agent = Agent(
         signals=VibeSignalProvider(),
-        brain=HeuristicBrain(min_conviction=args.min_conviction,
-                             size_usd=args.size),
+        brain=brain,
         policy=PolicyWallet(Policy()),
     )
     if _dry():

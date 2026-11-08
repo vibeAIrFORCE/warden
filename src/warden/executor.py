@@ -11,6 +11,12 @@ Warden's teeth, ported from the pattern we run in production:
     recorded testnet fire-test), and every cycle re-checks both.
   * every order rides the policy verdict the caller already obtained —
     the executor re-checks nothing; it refuses to be the policy layer.
+  * dispatch is clamped to the MARKET's own physics (exchange physics, not
+    policy): the action's coin is resolved against the live universe and
+    the effective leverage is clamped to maxLeverage, order size is rounded
+    to szDecimals and the limit px to the HL tick rule — a resolver failure
+    propagates BEFORE any SDK call, so an unclamped or unrounded action is
+    never dispatched. Clamp-only: no second action is ever auto-issued.
 
 Signing uses hyperliquid-python-sdk when installed (extras: `hl`); without
 it the executor builds actions and raises on post — dry mode works.
@@ -19,9 +25,10 @@ it the executor builds actions and raises on post — dry mode works.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
+from .assets import AssetMeta, AssetResolver, AssetUnresolved
 from .types import Side
 
 ORDER_ACTION_TYPES = ("OrderAction", "CancelAction", "UpdateLeverageAction")
@@ -93,12 +100,24 @@ BASE_URLS = {"prod": "https://api.hyperliquid.xyz",
 
 
 class HyperliquidExecutor:
-    def __init__(self, env: str = "testnet", private_key_env: str = "WARDEN_PRIVATE_KEY") -> None:
+    def __init__(
+        self,
+        env: str = "testnet",
+        private_key_env: str = "WARDEN_PRIVATE_KEY",
+        resolver: AssetResolver | None = None,
+    ) -> None:
         if env not in BASE_URLS:
             raise ValueError(f"unknown env {env!r} — use prod|testnet")
         self.env = env
         self.base_url = BASE_URLS[env]
         self._key_env = private_key_env
+        self.resolver = resolver if resolver is not None else AssetResolver(self.base_url)
+
+    async def resolve_asset(self, coin: str) -> AssetMeta:
+        """Coin symbol -> universe metadata (asset id / maxLeverage /
+        szDecimals). Cached by the resolver; unknown coins raise
+        AssetUnresolved — fail closed, never a guessed id."""
+        return await self.resolver.resolve(coin)
 
     @classmethod
     def from_env(cls) -> "HyperliquidExecutor":
@@ -127,9 +146,41 @@ class HyperliquidExecutor:
             order_type="ioc", leverage=max(1.0, leverage),
         )
 
+    async def _clamp_to_market(self, action: Any) -> Any:
+        """Resolve the action's coin and clamp it to the market's own
+        physics — closes policy.py's promise that "the market's own max
+        clamps again at the executor". Exchange physics, not policy: the
+        policy layer's text is untouched.
+
+        Fail closed: a resolver failure (AssetUnresolved or any HTTP/parse
+        failure) propagates — nothing is dispatched, an unclamped or
+        unrounded action never reaches the wire. Clamp-only: this never
+        issues a second action (no auto-updateLeverage before an order);
+        for OrderAction the clamped leverage lives on the action (metadata
+        + to_wire) — the SDK's order() carries no leverage field, HL
+        leverage is account-level and wire-effective only via
+        UpdateLeverageAction's int(leverage). Isolated-only is preserved:
+        is_cross is carried through unchanged (warden constructs False).
+        """
+        if isinstance(action, CancelAction):
+            return action  # a cancel carries no leverage/size to clamp
+        meta = await self.resolve_asset(action.coin)
+        if isinstance(action, OrderAction):
+            return replace(
+                action,
+                leverage=min(action.leverage, meta.max_leverage),
+                size=round(action.size, meta.sz_decimals),
+                limit_px=round(
+                    float(f"{action.limit_px:.5g}"), 6 - meta.sz_decimals
+                ),
+            )
+        # UpdateLeverageAction
+        return replace(action, leverage=min(action.leverage, meta.max_leverage))
+
     async def sign_and_post(self, action: Any) -> dict[str, Any]:
         """The ONLY dispatch. Anything not on the allowlist raises before a
-        key is touched; the two-key arm is re-checked every call."""
+        key is touched; the two-key arm is re-checked every call; the
+        market clamp runs after the arm gate and before any SDK call."""
         if not isinstance(action, ALLOWED):
             raise ActionNotAllowed(
                 f"{type(action).__name__} is not on the allowlist — "
@@ -137,6 +188,8 @@ class HyperliquidExecutor:
             )
         self.assert_armed()
         try:
+            import eth_account  # noqa: F401
+
             from hyperliquid.info import Info
             from hyperliquid.exchange import Exchange
             from hyperliquid.utils.signing import sign_l1_action  # noqa: F401
@@ -147,7 +200,25 @@ class HyperliquidExecutor:
         key = os.getenv(self._key_env, "")
         if not key:
             raise NotArmed(f"{self._key_env} not set")
-        # The SDK wiring (wallet load, L1 signature, POST /exchange) lands
-        # with the live-fire step — the typed-action boundary above is the
-        # security boundary and is final; see README Status.
-        raise RuntimeError("live signing ships with the fire-test — README Status")
+        # Market clamp FIRST — a resolver failure propagates before the
+        # wallet is even loaded, so nothing unclamped/unrounded dispatches.
+        # The typed-action boundary above is the security boundary and is
+        # final; see README Status.
+        action = await self._clamp_to_market(action)
+        wallet = eth_account.Account.from_key(key)
+        exchange = Exchange(wallet, self.base_url)
+        if isinstance(action, OrderAction):
+            return exchange.order(
+                action.coin,
+                action.is_buy,
+                action.size,
+                action.limit_px,
+                {"limit": {"tif": "Ioc" if action.order_type == "ioc" else "Gtc"}},
+                reduce_only=action.reduce_only,
+            )
+        if isinstance(action, CancelAction):
+            return exchange.cancel(action.coin, action.oid)
+        # UpdateLeverageAction — int(leverage) is the wire-effective clamp.
+        return exchange.update_leverage(
+            int(action.leverage), action.coin, is_cross=action.is_cross
+        )

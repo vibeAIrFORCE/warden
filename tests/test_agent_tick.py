@@ -8,6 +8,7 @@ executor even live. Network-free.
 import json
 
 from warden.agent import Agent
+from warden.assets import AssetMeta, MappingAssetResolver
 from warden.brain import HeuristicBrain
 from warden.executor import OrderAction
 from warden.ledger import JsonlLedger
@@ -23,12 +24,27 @@ class ListProvider:
         return list(self.signals)
 
 
+# The universe slice the recording double resolves against — same shape the
+# live resolver produces (array-index asset ids, testnet values pinned in
+# tests/test_asset_resolve.py). Any coin outside it raises AssetUnresolved,
+# which is exactly what the agent's fail-closed path must handle.
+_EXECUTOR_ASSET_MAP = {
+    "BTC": AssetMeta(asset=3, max_leverage=40, sz_decimals=5),
+    "ETH": AssetMeta(asset=4, max_leverage=25, sz_decimals=4),
+    "SOL": AssetMeta(asset=0, max_leverage=10, sz_decimals=2),
+}
+
+
 class RecordingExecutor:
     """Duck-typed stand-in: records every build_open and every post."""
 
     def __init__(self):
         self.opens = []
         self.posted = []
+        self._resolver = MappingAssetResolver(_EXECUTOR_ASSET_MAP)
+
+    async def resolve_asset(self, coin):
+        return await self._resolver.resolve(coin)
 
     def build_open(self, coin, asset, side, size, mark, leverage):
         action = OrderAction(coin=coin, asset=asset,
