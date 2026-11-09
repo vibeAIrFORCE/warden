@@ -141,7 +141,7 @@ def _probe_action(coin: str, meta: AssetMeta):
 # -------------------------------------------------------------------- order
 
 
-async def _mode_order(coin: str, notional: float) -> int:
+async def _mode_order(coin: str, notional: float, side: str = "LONG") -> int:
     _self_arm_in_process()
     executor = _testnet_executor()
     try:
@@ -167,7 +167,7 @@ async def _mode_order(coin: str, notional: float) -> int:
     # clamp produce the final wired size. The aggressive limit px
     # (mid * 1.01) is rounded to the HL tick rule inside the executor.
     action = executor.build_open(
-        coin, asset=meta.asset, side="LONG", size=notional, mark=mid,
+        coin, asset=meta.asset, side=side, size=notional, mark=mid,
         leverage=1.0,
     )
     wired_size = round(action.size, meta.sz_decimals)
@@ -244,13 +244,14 @@ async def _main(argv: list[str] | None = None) -> int:
     p_order = sub.add_parser("order", help="the gate leg: a real testnet order")
     p_order.add_argument("--coin", default="BTC")
     p_order.add_argument("--notional", type=float, default=15.0)
+    p_order.add_argument("--side", default="LONG", choices=["LONG", "SHORT"])
 
     args = ap.parse_args(argv)
     if args.mode == "resolve":
         return await _mode_resolve()
     if args.mode == "probe":
         return await _mode_probe(args.coin)
-    return await _mode_order(args.coin, args.notional)
+    return await _mode_order(args.coin, args.notional, args.side)
 
 
 if __name__ == "__main__":
