@@ -20,7 +20,7 @@ from .brain import BrainAdapter, HeuristicBrain, NearBrain, NearBrainUnavailable
 from .executor import HyperliquidExecutor
 from .ledger import JsonlLedger
 from .policy import PolicyWallet
-from .signals import VibeSignalProvider
+from .signals import SignalsUnavailable, VibeSignalProvider
 from .types import Policy, PositionState
 
 POLL_SECONDS = 60
@@ -103,6 +103,36 @@ def _dry() -> bool:
     return os.getenv("WARDEN_DRY", "1") not in ("0", "false", "off")
 
 
+def _guided_unavailable(reason: str) -> None:
+    """Print the caller-actionable next steps for a priced-feed failure.
+
+    SignalsUnavailable is honesty, not a bug — the feed is pay/trial-gated
+    and THIS caller's supply failed. Present it as guidance and keep the
+    loop alive (the next cycle succeeds once the env var is set).
+    """
+    if reason == "http_402":
+        head = "→ mint a FREE trial token (no account needed):"
+        extra = "  → or get a funded key: https://www.vibe.airforce/developers"
+    elif reason == "http_429":
+        head = "→ trial budget exhausted — mint a fresh token (they're capped):"
+        extra = "  → or get a funded key: https://www.vibe.airforce/developers"
+    elif reason == "parse_dropped_all_rows":
+        head = "→ payload shape drifted — report this: https://github.com/vibeAIrFORCE/warden"
+        extra = ""
+    else:
+        head = "→ check your credentials / try again shortly"
+        extra = "  → or get a funded key: https://www.vibe.airforce/developers"
+    print(f"[warden] signal feed unavailable ({reason})", file=sys.stderr)
+    print(f"  {head}", file=sys.stderr)
+    if reason in ("http_402", "http_429"):
+        print("      curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth",
+              file=sys.stderr)
+        print("  → then:  VIBE_TRIAL_TOKEN=trial_… uv run python -m warden.agent --dry",
+              file=sys.stderr)
+    if extra:
+        print(extra, file=sys.stderr)
+
+
 async def _main() -> None:
     ap = argparse.ArgumentParser(prog="warden")
     ap.add_argument("--dry", action="store_true", default=True)
@@ -131,11 +161,17 @@ async def _main() -> None:
     if _dry():
         print("[warden] DRY — decisions print, nothing sends")
     while True:
-        for out in await agent.tick():
-            v = out["verdict"]
-            s = out["signal"]
-            print(f"[warden] {s.coin} {s.side} "
-                  f"{'FOLLOW' if v.allowed else 'skip'} — {v.reason}")
+        try:
+            for out in await agent.tick():
+                v = out["verdict"]
+                s = out["signal"]
+                print(f"[warden] {s.coin} {s.side} "
+                      f"{'FOLLOW' if v.allowed else 'skip'} — {v.reason}")
+        except SignalsUnavailable as exc:
+            # Guided presentation only — every other exception still
+            # propagates loudly (a real bug must crash). The loop keeps
+            # polling: set the env var and the next cycle succeeds.
+            _guided_unavailable(exc.reason)
         await asyncio.sleep(args.poll)
 
 
