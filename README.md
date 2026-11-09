@@ -38,6 +38,19 @@ uv run pytest -q                       # the teeth, network-free
 uv run python -m warden.agent --dry
 ```
 
+### Configure
+
+Every key is optional and reads from the environment — copy the template and
+fill what you need (signals trial token first; brain + executor keys later):
+
+```bash
+cp .env.example .env    # then edit — every field is documented inline
+```
+
+The teeth battery needs NONE of them (`uv run pytest` is network-free); the
+feed needs a trial token or API key; real orders additionally need the
+executor arm ritual below.
+
 ### Arm the executor
 
 The executor is inert until TWO keys are set, and every dispatch re-checks
