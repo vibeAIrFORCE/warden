@@ -74,7 +74,7 @@ think everyone should copy.
 | Layer | State |
 |---|---|
 | Policy wallet + action allowlist | working, unit-tested (the teeth) |
-| Signal providers | local files working; public feed wired but returns zero rows today (probed through `VibeSignalProvider().latest()`, 2026-11-08) |
+| Signal providers | local files working; **public feed LIVE** — the priced delivered-signals SKU (`/x402/alpha/jev/deliveries`): free trial token for the first run, credits or x402 beyond; keyless callers get an honest `SignalsUnavailable` 402, never a fake-empty book |
 | Brain adapters | heuristic working · model slot stubbed (weights pending eval gate) |
 | HL executor (sign + post) | **PASSED** — live on hyperliquid-python-sdk; testnet fire-test recorded ([docs/FIRE_TEST_RECORD_2026-11-08.md](docs/FIRE_TEST_RECORD_2026-11-08.md): BTC $15.10 filled, ORDER_OID 64900271392) |
 | 1Click settlement | quote/status client built; end-to-end pending live fire |
@@ -111,8 +111,18 @@ uv run pytest -q
 
 ### Watch the follow loop (dry — decisions print, nothing sends)
 
+First, mint a FREE trial token (no account needed — capped, read-only):
+
 ```bash
-timeout 15 uv run python -u -m warden.agent --dry
+curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth | grep -oE 'trial_[a-f0-9]+'
+```
+
+```text
+trial_6b2f9a1c44e84d67a293b5c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0
+```
+
+```bash
+VIBE_TRIAL_TOKEN=trial_… timeout 15 uv run python -u -m warden.agent --dry
 ```
 
 The loop polls the live feed every 60 seconds until Ctrl-C, so the `timeout 15`
