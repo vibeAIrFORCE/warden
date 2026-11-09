@@ -127,10 +127,46 @@ def _guided_unavailable(reason: str) -> None:
     if reason in ("http_402", "http_429"):
         print("      curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth",
               file=sys.stderr)
-        print("  → then:  VIBE_TRIAL_TOKEN=trial_… uv run python -m warden.agent --dry",
-              file=sys.stderr)
+        print("  → then (copy the WHOLE token — no dots):", file=sys.stderr)
+        print("      export VIBE_TRIAL_TOKEN=trial_xxxxxxxxxx", file=sys.stderr)
+        print("      uv run python -m warden.agent --dry", file=sys.stderr)
     if extra:
         print(extra, file=sys.stderr)
+
+
+def _print_setup_path() -> None:
+    """The one-time startup checklist — what's configured, what's next.
+    The flow: BRAIN first (NEAR), then SIGNALS (VIBE), then (optionally)
+    the executor arm. Printed once at startup; every step is skippable —
+    the agent runs degraded-but-honest without any of them."""
+    import os
+
+    print("[warden] setup checklist:")
+    # 1. BRAIN — the veto decision model
+    if os.getenv("WARDEN_BRAIN_URL") and os.getenv("NEAR_API_KEY"):
+        print("  ✓ brain: NearBrain configured (WARDEN_BRAIN_URL + NEAR_API_KEY)")
+    else:
+        print("  · brain: heuristic fallback (no veto model configured)")
+        print("    → for the Jev veto brain, set TWO vars:")
+        print("        WARDEN_BRAIN_URL=https://cloud-api.near.ai/v1")
+        print("        NEAR_API_KEY=<your NEAR AI Cloud key — cloud-api.near.ai>")
+    # 2. SIGNALS — where the follow list comes from
+    if os.getenv("VIBE_API_KEY"):
+        print("  ✓ signals: funded VIBE API key (per-call credits)")
+    elif os.getenv("VIBE_TRIAL_TOKEN"):
+        print("  ✓ signals: trial token (free, ~3 calls — then mint another)")
+    else:
+        print("  · signals: NOT configured — the feed will refuse (402)")
+        print("    → free trial (no account):")
+        print("        curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth")
+        print("      then: export VIBE_TRIAL_TOKEN=trial_xxxxxxxxxx   # the WHOLE token")
+        print("    → or a funded key: https://www.vibe.airforce/developers")
+    # 3. EXECUTOR — real orders (optional; dry is the default)
+    if os.getenv("WARDEN_ENABLED") == "1" and os.getenv("WARDEN_TESTNET_FIRE_TEST") == "pass":
+        print("  ✓ executor: ARMED (real orders when WARDEN_DRY=0)")
+    else:
+        print("  · executor: inert (dry-only) — arm later, see README 'Arm the executor'")
+    print()
 
 
 async def _main() -> None:
@@ -160,6 +196,7 @@ async def _main() -> None:
     )
     if _dry():
         print("[warden] DRY — decisions print, nothing sends")
+    _print_setup_path()
     while True:
         try:
             for out in await agent.tick():
@@ -176,4 +213,9 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        # Ctrl-C is the DESIGNED stop for an infinite poll loop — exit
+        # silently (exit code 130 = SIGINT), never a CancelledError dump.
+        raise SystemExit(130)
