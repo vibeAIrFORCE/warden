@@ -43,7 +43,7 @@ uv run python -m warden.agent --dry
 The executor is inert until TWO keys are set, and every dispatch re-checks
 both: `WARDEN_ENABLED=1` (the flag) plus `WARDEN_TESTNET_FIRE_TEST=pass`
 (the marker an operator exports only after a recorded testnet fire-test).
-Status today: **signing wired — testnet fire-test pending**. The typed-action
+Status today: **fire-test PASSED** (see docs/FIRE_TEST_RECORD_2026-11-08.md — BTC LONG $15.10 filled on HL testnet, ORDER_OID 64900271392). The typed-action
 allowlist and the arm gate are live and tested — see *Do X, see Y* below for
 the refusal probes you can run yourself, right now, network-free.
 
@@ -76,7 +76,7 @@ think everyone should copy.
 | Policy wallet + action allowlist | working, unit-tested (the teeth) |
 | Signal providers | local files working; public feed wired but returns zero rows today (probed through `VibeSignalProvider().latest()`, 2026-11-08) |
 | Brain adapters | heuristic working · model slot stubbed (weights pending eval gate) |
-| HL executor (sign + post) | signing wired — testnet fire-test pending (the typed-action allowlist and the two-key arm gate are live and tested) |
+| HL executor (sign + post) | **PASSED** — live on hyperliquid-python-sdk; testnet fire-test recorded ([docs/FIRE_TEST_RECORD_2026-11-08.md](docs/FIRE_TEST_RECORD_2026-11-08.md): BTC $15.10 filled, ORDER_OID 64900271392) |
 | 1Click settlement | quote/status client built; end-to-end pending live fire |
 | The follow loop | dry mode working |
 
