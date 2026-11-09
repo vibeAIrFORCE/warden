@@ -65,11 +65,31 @@ class VibeSignalProvider:
         self._limit = limit
 
     def _headers(self) -> dict[str, str]:
-        """Credential tri-state: key lane wins, then trial, else keyless."""
+        """Credential tri-state: key lane wins, then trial, else keyless.
+        A malformed credential (placeholder dots, whitespace, non-ASCII —
+        all seen in the wild) refuses HERE with one guided line instead of
+        an httpx UnicodeEncodeError deep inside a header merge."""
         if self._api_key:
-            return {"x-api-key": self._api_key}
+            key = self._api_key
+            if not (key.startswith("pk_") and ":sk_" in key and key.isascii()):
+                raise SignalsUnavailable(
+                    reason="bad_api_key_format — expected pk_…:sk_… (get one "
+                           "at https://www.vibe.airforce/developers); paste "
+                           "the WHOLE pair, no dots or spaces"
+                )
+            return {"x-api-key": key}
         if self._trial:
-            return {"Authorization": f"Bearer {self._trial}"}
+            tok = self._trial
+            if not (tok.startswith("trial_") and tok.isascii()
+                    and len(tok) <= 128 and "…" not in tok):
+                raise SignalsUnavailable(
+                    reason="bad_trial_token_format — expected the WHOLE "
+                           "trial_ token the curl prints (38 chars, no "
+                           "dots/ellipsis); mint another:"
+                           " curl -s -X POST "
+                           "https://api.vibe.airforce/api/vibe-tools/trial-auth"
+                )
+            return {"Authorization": f"Bearer {tok}"}
         return {}
 
     async def latest(self) -> Sequence[Signal]:

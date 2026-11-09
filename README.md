@@ -135,7 +135,8 @@ trial_6b2f9a1c44e84d67a293b5c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0
 ```
 
 ```bash
-VIBE_TRIAL_TOKEN=trial_… timeout 15 uv run python -u -m warden.agent --dry
+# paste YOUR token from the curl above — the WHOLE 38-char string, no dots:
+VIBE_TRIAL_TOKEN=trial_1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d timeout 15 uv run python -u -m warden.agent --dry
 ```
 
 The loop polls the live feed every 60 seconds until Ctrl-C, so the `timeout 15`
