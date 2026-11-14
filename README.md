@@ -34,8 +34,10 @@ three-layer verifiable trader:
 uv sync
 uv run pytest -q                       # the teeth, network-free
 
-# ONE command sets you up — mints a FREE trial token (no account) and
-# writes it into .env for you:
+# ONE command guides you through setup — collects + LIVE-verifies your
+# brain key (NEAR AI Cloud) and mints + verifies a FREE trial token
+# (no account), writing both into .env. Enter skips any step.
+# Non-interactive shells (pipes, CI) mint a trial token only:
 uv run python -m warden.agent --setup
 
 # then watch the follow loop (dry — prints decisions, sends nothing).
@@ -48,6 +50,24 @@ runs a single tick instead. To go past the trial cap, get a funded key at
 [vibe.airforce/developers](https://www.vibe.airforce/developers).
 
 > Manual path: `curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth | grep -oE 'trial_[a-f0-9]+'` then `export VIBE_TRIAL_TOKEN=<the WHOLE token>` — `--setup` does exactly this for you.
+
+#### What --setup walks you through
+
+```
+① BRAIN — paste a NEAR AI Cloud key (cloud-api.near.ai); ONE real
+   chat/completions call proves it BEFORE anything is written:
+   verified → WARDEN_BRAIN_URL + NEAR_API_KEY land in .env together;
+   401 → "key rejected", nothing written, retry-or-skip.
+② SIGNALS — mints the free trial token, verifies it against the live
+   deliveries SKU and prints the open-signal count (402/429 → honest
+   cooldown note; the token itself is still written).
+③ EXECUTOR — inert by design; arm later via the fire-test ritual.
+```
+
+Keys already exported in your shell are detected and skipped; every prompt
+accepts bare Enter as skip. The flow closes with a masked `.env` summary
+(`NEAR_API_KEY=sk-a…4321`) — full secrets never print. Re-running is
+idempotent: existing `.env` lines are replaced in place, never duplicated.
 
 ### Configure
 

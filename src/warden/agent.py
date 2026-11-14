@@ -4,6 +4,11 @@ Exactly-once per signal_id (the agent never re-follows a delivery it has
 already acted on), the brain proposes, the policy disposes, the executor
 executes — in that order, always. Dry mode is the default: the loop runs
 end-to-end and prints every decision without sending anything.
+
+`--setup` is the operator on-ramp: it collects and LIVE-verifies the brain
+key and the trial-signal token, then prints a masked summary — every step
+Enter-skippable. Without a TTY (or with --non-interactive) it degrades to
+the old fire-and-forget token mint, so pipes and CI never block.
 """
 
 from __future__ import annotations
@@ -529,9 +534,21 @@ def _print_status() -> None:
         print(_c("dim", "[warden] executor arm: inert (dry-only)"))
 
 
-# --- --setup: mint a trial token and write it into .env ----------------------
+# --- --setup: guided, live-verified onboarding --------------------------------
+#
+# Three steps, every one Enter-skippable (the agent runs degraded-but-honest
+# without any of them — the checklist at startup says which are missing):
+#   ① BRAIN — paste a NEAR AI Cloud key; ONE chat/completions "Reply with
+#     OK" proves the key before anything is written (401 → not written).
+#   ② SIGNALS — mint the free trial token and verify it against the
+#     deliveries SKU (402/429 → honest note; the token itself is fine).
+#   ③ EXECUTOR — inert by design; one pointer line, never a prompt.
+# A populated-then-masked .env summary closes the flow. Non-interactive
+# shells (pipes, CI) degrade to the legacy mint-only path — never a hang.
 
 _SETUP_URL = "https://api.vibe.airforce/api/vibe-tools/trial-auth"
+_BRAIN_URL_DEFAULT = "https://cloud-api.near.ai/v1"
+_BRAIN_MODEL = "z-ai/glm-5.3-flash"          # NearBrain's wire default
 
 
 def _mask_token(token: str) -> str:
@@ -539,58 +556,291 @@ def _mask_token(token: str) -> str:
     return f"trial_{token[6:12]}…"
 
 
-def _write_env_token(env_path: Path, token: str) -> bool:
-    """Append-or-replace VIBE_TRIAL_TOKEN in .env.
+def _mask_secret(secret: str) -> str:
+    """first4+last4 with the middle elided — for NEAR_API_KEY lines.
+    Degenerates honestly on short values (never fabricates middle chars)."""
+    if len(secret) <= 8:
+        return "…"
+    return f"{secret[:4]}…{secret[-4:]}"
 
-    A `VIBE_TRIAL_TOKEN=` line gets its VALUE replaced in place (every
-    other line byte-identical); no such line → appended. A missing file is
-    created with the template's two-line header. Returns True when the
-    file was created fresh."""
+
+def _write_env_var(env_path: Path, key: str, value: str) -> bool:
+    """Append-or-replace `<key>=<value>` in .env.
+
+    A `<key>=` line gets its VALUE replaced in place (every other line
+    byte-identical); no such line → appended. A missing file is created
+    with the template's header line. Returns True when the file was
+    created fresh."""
     if env_path.exists():
         lines = env_path.read_text().splitlines()
         for i, line in enumerate(lines):
-            if line.startswith("VIBE_TRIAL_TOKEN="):
-                lines[i] = f"VIBE_TRIAL_TOKEN={token}"
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}={value}"
                 env_path.write_text("\n".join(lines) + "\n")
                 return False
-        env_path.write_text("\n".join(lines) + "\nVIBE_TRIAL_TOKEN=%s\n" % token)
+        env_path.write_text("\n".join(lines) + "\n%s=%s\n" % (key, value))
         return False
     env_path.write_text(
         "# Warden configuration — see .env.example for every field.\n"
-        "VIBE_TRIAL_TOKEN=%s\n" % token)
+        "%s=%s\n" % (key, value))
     return True
 
 
-async def _run_setup(http=None) -> int:
-    """Mint a trial token, persist it to .env, print the next command."""
+def _write_env_token(env_path: Path, token: str) -> bool:
+    """The trial-token spelling of `_write_env_var` (the legacy name kept
+    so existing greps and call sites land somewhere real)."""
+    return _write_env_var(env_path, "VIBE_TRIAL_TOKEN", token)
+
+
+async def _mint_trial_token(http) -> str:
+    """ONE mint POST → the `trial_…` token. Raises RuntimeError with a
+    caller-printable message on every failure shape (transport, non-200,
+    unexpected body, missing token). The injected client is never closed."""
     import httpx
 
-    env_path = Path(os.getenv("WARDEN_ENV_FILE", ".env"))
     try:
-        own = http is None
-        client = http or httpx.AsyncClient(timeout=15.0)
-        try:
-            res = await client.post(_SETUP_URL)
-        finally:
-            if own:
-                await client.aclose()
+        res = await http.post(_SETUP_URL)
     except (httpx.TransportError, httpx.TimeoutException) as exc:
-        print(f"[warden] trial mint failed: {type(exc).__name__} — try again",
-              file=sys.stderr)
-        return 1
+        raise RuntimeError(f"trial mint failed: {type(exc).__name__}") from exc
     if res.status_code != 200:
-        print(f"[warden] trial mint failed: http {res.status_code}",
-              file=sys.stderr)
-        return 1
+        raise RuntimeError(f"trial mint failed: http {res.status_code}")
     try:
         token = res.json()["data"]["token"]
     except (ValueError, KeyError, TypeError):
-        print("[warden] trial mint failed: unexpected response shape",
-              file=sys.stderr)
-        return 1
+        raise RuntimeError("trial mint failed: unexpected response shape")
     if not (isinstance(token, str) and token.startswith("trial_")):
-        print("[warden] trial mint failed: token missing from response",
-              file=sys.stderr)
+        raise RuntimeError("trial mint failed: token missing from response")
+    return token
+
+
+async def _verify_brain(http, api_key: str,
+                        base_url: str = _BRAIN_URL_DEFAULT) -> tuple[bool, str]:
+    """ONE chat/completions probe in the NearBrain wire shape — Bearer key,
+    tiny messages payload. 200 with ANY body = verified (the veto brain's
+    real contract is parse-fail-closed; here we only prove the endpoint and
+    the key). Returns (ok, kind) where kind ∈ {"verified", "rejected",
+    "unreachable"} — 401/403 are a KEY problem (rejected), timeouts and
+    5xx are an UPSTREAM problem (unreachable). Never constructs a NearBrain
+    (its constructor requires env config); ~the same wire, written out."""
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": _BRAIN_MODEL,
+        "messages": [{"role": "user", "content": "Reply with OK"}],
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        res = await http.post(url, json=payload, headers=headers)
+    except (httpx.TimeoutException, httpx.TransportError):
+        return False, "unreachable"
+    if res.status_code in (401, 403):
+        return False, "rejected"
+    if res.status_code != 200:
+        return False, "unreachable"
+    return True, "verified"
+
+
+async def _verify_feed(http, token: str) -> tuple[bool, int, str]:
+    """Verify the freshly minted trial token against the deliveries SKU —
+    the SAME request the loop's first cycle will make. Returns
+    (ok, open_signals, kind): 200 → the open-signal count (every parsed
+    row the provider returns); 402/429 → valid-but-capped (honest note,
+    the token itself is fine and IS written); anything else → unknown."""
+    try:
+        provider = VibeSignalProvider(trial_token=token, http=http)
+        signals = list(await provider.latest())
+    except SignalsUnavailable as exc:
+        return False, 0, exc.reason        # "http_402" / "http_429"
+    return True, len(signals), "verified"
+
+
+def _ask(prompt: str, *, hidden: bool = False) -> str:
+    """One interactive read. getpass for secrets (no terminal echo);
+    EOFError / closed stdin → empty string (= skip), matching bare Enter.
+    The test seam: monkeypatch warden.agent._ask."""
+    if hidden:
+        import getpass
+        try:
+            return getpass.getpass(prompt)
+        except EOFError:
+            return ""
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def _interactive() -> bool:
+    """A real operator terminal — BOTH stdin and stdout must be TTYs.
+    A piped stdout (`--setup | tee`) is presentation-only and still fine to
+    prompt on; a piped STDIN is what must never block."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+async def _setup_step_brain(http, env_path: Path) -> bool:
+    """① BRAIN — env pre-check → paste (hidden) → live verify → write
+    WARDEN_BRAIN_URL + NEAR_API_KEY TOGETHER, only on a verified key.
+    401 → not written, retry-or-skip; timeout/5xx → one retry offer."""
+    if os.getenv("NEAR_API_KEY"):
+        print(_c("green", "✓ brain already configured in environment"))
+        return True
+    key = _ask("Paste NEAR_API_KEY (Enter = skip): ", hidden=True).strip()
+    if not key:
+        print(_c("dim", "  · skipped — the heuristic fallback brain stays "
+                        "active (set NEAR_API_KEY anytime)"))
+        return False
+    while True:
+        print("  → verifying… ", end="", flush=True)
+        ok, kind = await _verify_brain(http, key)
+        if ok:
+            fresh = not env_path.exists()
+            _write_env_var(env_path, "WARDEN_BRAIN_URL", _BRAIN_URL_DEFAULT)
+            _write_env_var(env_path, "NEAR_API_KEY", key)
+            print(_c("green",
+                     f"✓ brain verified and written to {env_path}"))
+            if fresh:
+                print(_c("dim", "  (.env created)"))
+            return True
+        if kind == "rejected":
+            # the key itself is wrong — writing it would ship a brain that
+            # refuses every signal; ask retry-or-skip instead
+            print(_c("red",
+                     "✗ key rejected — check it at cloud-api.near.ai "
+                     "(nothing written)"))
+            again = _ask("Paste a different key (Enter = skip): ",
+                         hidden=True).strip()
+            if not again:
+                print(_c("dim", "  · skipped — brain not configured"))
+                return False
+            key = again
+            continue
+        # unreachable (timeout / 5xx): ONE retry offer, then skip
+        print(_c("red", "✗ NEAR unreachable right now"))
+        if _ask("Retry verify? [y/N]: ").strip().lower() in ("y", "yes"):
+            continue
+        print(_c("dim", "  · skipped — verify later: export NEAR_API_KEY=… "
+                        "and re-run --setup"))
+        return False
+
+
+async def _setup_step_signals(http, env_path: Path) -> str | None:
+    """② SIGNALS — mint (offering a refresh when one is already set), then
+    verify against the deliveries SKU. Returns the minted token or None.
+    VIBE_API_KEY in the environment wins over any trial token (the
+    provider's own tri-state), so minting would be waste."""
+    if os.getenv("VIBE_API_KEY"):
+        print(_c("green", "✓ signals already configured in environment "
+                          "(funded VIBE_API_KEY)"))
+        return None
+    if os.getenv("VIBE_TRIAL_TOKEN"):
+        ans = _ask("VIBE_TRIAL_TOKEN already set — mint a fresh one? "
+                   "[Y/n]: ").strip().lower()
+        if ans in ("n", "no"):
+            print(_c("dim", "  · keeping the existing token"))
+            return None
+    print("  ✓ minting… ", end="", flush=True)
+    try:
+        token = await _mint_trial_token(http)
+    except RuntimeError as exc:
+        print(_c("red", f"✗ {exc}"))
+        return None
+    created = _write_env_token(env_path, token)
+    verb = "created" if created else "updated"
+    print(_c("green", f"✓ token written to {env_path} ({verb}) — "
+                      f"VIBE_TRIAL_TOKEN={_mask_token(token)}"))
+    print("  → verifying… ", end="", flush=True)
+    ok, count, kind = await _verify_feed(http, token)
+    if ok:
+        print(_c("green", f"✓ feed reachable — {count} open signal(s) on "
+                          "the book right now"))
+    elif kind in ("http_402", "http_429"):
+        # honest note: the mint succeeded and the token IS written — the
+        # cap/mint lane just refused THIS probe (cooldown, budget shape)
+        print(_c("amber", f"✗ feed said {kind} — the token IS written and "
+                          "will work after the cooldown "
+                          "(trial tokens are capped)"))
+    else:
+        print(_c("amber", f"✗ feed unreachable ({kind}) — token written; "
+                          "the loop will tell you more on first run"))
+    return token
+
+
+def _print_setup_summary(env_path: Path, wrote_brain: bool) -> None:
+    """═══ DONE — your .env ═══ — masked values only, then the next run.
+    Reads the vars back out of the FILE we just wrote (the truth of the
+    artifact, not the process env — exports may differ)."""
+    def _env_value(key: str) -> str | None:
+        if not env_path.exists():
+            return None
+        for line in env_path.read_text().splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1]
+        return None
+
+    print()
+    print(_c("bold", "═══ DONE — your .env ═══"))
+    if wrote_brain:
+        print(f"  WARDEN_BRAIN_URL={_env_value('WARDEN_BRAIN_URL')}")
+        key = _env_value("NEAR_API_KEY") or ""
+        print(f"  NEAR_API_KEY={_mask_secret(key)}")
+    trial = _env_value("VIBE_TRIAL_TOKEN")
+    if trial:
+        print(f"  VIBE_TRIAL_TOKEN={_mask_token(trial)}")
+    print()
+    print("▶ Next: uv run python -u -m warden.agent --dry")
+
+
+async def _run_setup(http=None, non_interactive: bool = False) -> int:
+    """The --setup entrypoint.
+
+    Interactive (TTY + no --non-interactive): the guided ①②③ flow with a
+    live brain verify, a feed verify and the masked summary — total wall
+    time is two HTTP round trips. Non-interactive (no TTY or the flag):
+    the legacy fire-and-forget mint — token written, one line saying why,
+    exit. Pipes and CI must never block on input()."""
+    import httpx
+
+    env_path = Path(os.getenv("WARDEN_ENV_FILE", ".env"))
+    own = http is None
+    client = http or httpx.AsyncClient(timeout=15.0)
+    try:
+        if non_interactive or not _interactive():
+            if not non_interactive:
+                print("[warden] non-interactive shell — minted trial token "
+                      "only (run --setup in a terminal for the guided flow)")
+            return await _setup_mint_only(client, env_path)
+
+        from . import __version__
+        print(_c("bold", f"WARDEN v{__version__} — setup"))
+        print()
+        print(_c("bold", "① BRAIN — the veto decision model (NEAR AI Cloud)"))
+        print("   Get a key: https://cloud-api.near.ai")
+        wrote_brain = await _setup_step_brain(client, env_path)
+        print()
+        print(_c("bold",
+                 "② SIGNALS — the follow feed (free trial, no account)"))
+        await _setup_step_signals(client, env_path)
+        print()
+        print(_c("bold", "③ EXECUTOR — real orders (advanced; Enter = skip, "
+                         "dry mode is default)"))
+        print(_c("dim", "  · arm later via the fire-test ritual — see README "
+                        "'Arm the executor'"))
+        _print_setup_summary(env_path, wrote_brain)
+        return 0
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def _setup_mint_only(http, env_path: Path) -> int:
+    """The legacy fire-and-forget path (pipes, CI, --non-interactive):
+    mint, write, print the next command. Shares the mint coroutine with
+    the guided path — one wire shape, two presentations."""
+    try:
+        token = await _mint_trial_token(http)
+    except RuntimeError as exc:
+        print(f"[warden] {exc}", file=sys.stderr)
         return 1
     created = _write_env_token(env_path, token)
     verb = "created" if created else "updated"
@@ -611,7 +861,12 @@ async def _main() -> None:
                          "status = one read-only screen, no polling")
     ap.add_argument("--dry", action="store_true", default=True)
     ap.add_argument("--setup", action="store_true",
-                    help="mint a free trial token and write it into .env")
+                    help="guided setup — collects + live-verifies the brain "
+                         "key and trial token, writes .env (Enter skips any "
+                         "step; non-interactive shells mint a token only)")
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="with --setup: skip the guided prompts entirely "
+                         "(pipes, CI) — mint a trial token and exit")
     ap.add_argument("--fresh", action="store_true",
                     help="rename the ledger (<name>.bak-<epoch>) and start "
                          "deciding from zero")
@@ -623,7 +878,8 @@ async def _main() -> None:
     args = ap.parse_args()
 
     if args.setup:
-        raise SystemExit(await _run_setup())
+        raise SystemExit(await _run_setup(
+            non_interactive=args.non_interactive))
 
     # Construction-time brain selection ONLY: the remote veto brain first
     # (NearBrain, configured via WARDEN_BRAIN_URL), falling back to the
