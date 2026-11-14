@@ -7,7 +7,12 @@ executor even live. Network-free.
 
 import json
 
-from warden.agent import Agent
+from warden.agent import (
+    Agent,
+    _load_signal_preferences,
+    _pref_side_param,
+    _pref_tokens_param,
+)
 from warden.assets import AssetMeta, MappingAssetResolver
 from warden.brain import HeuristicBrain
 from warden.executor import OrderAction
@@ -183,3 +188,116 @@ async def test_no_executor_still_records_and_never_crashes(
     assert outs[0]["verdict"].allowed is True
     rows = ledger_rows(path)
     assert rows[0]["executed"] is False
+
+
+# ------------------------------------------------ your preferences (env)
+
+
+def _prefs_env(monkeypatch, **vals) -> None:
+    """Set the three preference vars per kwargs; clear the rest."""
+    for var in ("WARDEN_TICKERS", "WARDEN_MIN_CONVICTION", "WARDEN_SIDES"):
+        if var in vals:
+            monkeypatch.setenv(var, vals[var])
+        else:
+            monkeypatch.delenv(var, raising=False)
+
+
+def test_prefs_absent_means_no_preference(monkeypatch):
+    """All three vars absent → every field None (the unfiltered agent)."""
+    _prefs_env(monkeypatch)
+    prefs = _load_signal_preferences()
+    assert prefs.tickers is None
+    assert prefs.min_conviction is None
+    assert prefs.sides is None
+
+
+def test_prefs_valid_values_parse(monkeypatch):
+    _prefs_env(monkeypatch, WARDEN_TICKERS="USELESS,BTC",
+               WARDEN_MIN_CONVICTION="60", WARDEN_SIDES="SHORT")
+    prefs = _load_signal_preferences()
+    assert prefs.tickers == frozenset({"USELESS", "BTC"})
+    assert prefs.min_conviction == 60.0
+    assert prefs.sides == frozenset({"SHORT"})
+
+
+def test_prefs_tickers_uppercase_normalization(monkeypatch):
+    """Lowercase env input normalizes to the book's uppercase symbols."""
+    _prefs_env(monkeypatch, WARDEN_TICKERS="useless,btc")
+    assert _load_signal_preferences().tickers == frozenset({"USELESS", "BTC"})
+
+
+def test_prefs_invalid_conviction_fails_closed_with_one_warning(
+        monkeypatch, capsys):
+    _prefs_env(monkeypatch, WARDEN_MIN_CONVICTION="not-a-number")
+    prefs = _load_signal_preferences()
+    assert prefs.min_conviction is None
+    err = capsys.readouterr().err
+    assert "WARDEN_MIN_CONVICTION" in err
+    assert len(err.strip().splitlines()) == 1      # ONE warning line
+
+
+def test_prefs_conviction_bounds(monkeypatch, capsys):
+    """0 is a valid floor; anything outside [0, 100] fails closed + warns."""
+    _prefs_env(monkeypatch, WARDEN_MIN_CONVICTION="0")
+    assert _load_signal_preferences().min_conviction == 0.0
+    _prefs_env(monkeypatch, WARDEN_MIN_CONVICTION="150")
+    prefs = _load_signal_preferences()
+    assert prefs.min_conviction is None
+    assert "WARDEN_MIN_CONVICTION" in capsys.readouterr().err
+
+
+def test_prefs_sides_invalid_token_ignored(monkeypatch, capsys):
+    """A bad token among good ones is dropped (var named in ONE warning),
+    the valid rest still applies."""
+    _prefs_env(monkeypatch, WARDEN_SIDES="SHORT,FLAT")
+    prefs = _load_signal_preferences()
+    assert prefs.sides == frozenset({"SHORT"})
+    err = capsys.readouterr().err
+    assert "WARDEN_SIDES" in err
+    assert len(err.strip().splitlines()) == 1
+
+
+def test_prefs_sides_all_invalid_fails_closed(monkeypatch, capsys):
+    _prefs_env(monkeypatch, WARDEN_SIDES="FLAT")
+    prefs = _load_signal_preferences()
+    assert prefs.sides is None
+    assert "WARDEN_SIDES" in capsys.readouterr().err
+
+
+def test_prefs_side_and_tokens_param_conversion():
+    """frozenset → the SKU's wire shapes: one side (both = no filter) and a
+    sorted comma-joined tokens string (byte-stable query)."""
+    assert _pref_side_param(frozenset({"SHORT"})) == "SHORT"
+    assert _pref_side_param(frozenset({"LONG"})) == "LONG"
+    assert _pref_side_param(frozenset({"LONG", "SHORT"})) is None
+    assert _pref_side_param(None) is None
+    assert _pref_tokens_param(frozenset({"USELESS", "BTC"})) == "BTC,USELESS"
+    assert _pref_tokens_param(None) is None
+
+
+async def test_prefs_policy_allowed_coins_refusal_still_fires(
+        monkeypatch, tmp_path):
+    """The double gate's local half: WARDEN_TICKERS → Policy.allowed_coins.
+    A coin outside the allowlist is refused at admit time even when the
+    feed delivers it (server filter bypassed or drifted) — and every other
+    Policy field stays at its default."""
+    _prefs_env(monkeypatch, WARDEN_TICKERS="BTC")
+    prefs = _load_signal_preferences()
+
+    class AllowAllBrain:
+        async def decide(self, signal, state):
+            return Decision(follow=True, size_usd=10.0, reason="wants in",
+                            source="test")
+
+    a = Agent(
+        signals=ListProvider([sig("s1", coin="USELESS")]),
+        brain=AllowAllBrain(),
+        policy=PolicyWallet(Policy(allowed_coins=prefs.tickers)),
+        ledger=JsonlLedger(tmp_path / "ledger.jsonl"),
+    )
+
+    outs = await a.tick()
+
+    assert outs[0]["verdict"].allowed is False
+    assert "not on the coin allowlist" in outs[0]["verdict"].reason
+    assert ledger_rows(tmp_path / "ledger.jsonl")[0]["admitted"] is False

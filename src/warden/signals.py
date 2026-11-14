@@ -48,6 +48,11 @@ class VibeSignalProvider:
     endpoint answers with its x402 payment challenge). The agent follows
     the book's own recorded entry price — same entry as the book, never
     the current mark.
+
+    Optional preference filters (min_conviction / side / tokens) ride the
+    query string — the backend filters server-side, so a narrowed book
+    costs fewer rows over the wire. Only non-None params are sent: absent
+    filters produce the exact unfiltered URL as before.
     """
 
     def __init__(
@@ -57,12 +62,18 @@ class VibeSignalProvider:
         trial_token: str | None = None,
         http: httpx.AsyncClient | None = None,
         limit: int = 25,
+        min_conviction: float | None = None,
+        side: str | None = None,
+        tokens: str | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._api_key = api_key if api_key is not None else os.getenv("VIBE_API_KEY")
         self._trial = trial_token if trial_token is not None else os.getenv("VIBE_TRIAL_TOKEN")
         self._http = http
         self._limit = limit
+        self._min_conviction = min_conviction
+        self._side = side
+        self._tokens = tokens
 
     def _headers(self) -> dict[str, str]:
         """Credential tri-state: key lane wins, then trial, else keyless.
@@ -95,10 +106,20 @@ class VibeSignalProvider:
     async def latest(self) -> Sequence[Signal]:
         own = self._http is None
         http = self._http or httpx.AsyncClient(timeout=15.0)
+        # Preference filters ride the query ONLY when set — insertion order
+        # keeps status/limit first, so the no-preferences URL is byte-identical
+        # to the unfiltered wire of every release before them.
+        params: dict[str, object] = {"status": "open", "limit": self._limit}
+        if self._min_conviction is not None:
+            params["min_conviction"] = self._min_conviction
+        if self._side is not None:
+            params["side"] = self._side
+        if self._tokens is not None:
+            params["tokens"] = self._tokens
         try:
             res = await http.get(
                 f"{self._base}/x402/alpha/jev/deliveries",
-                params={"status": "open", "limit": self._limit},
+                params=params,
                 headers=self._headers(),
             )
             if res.status_code in (402, 429):

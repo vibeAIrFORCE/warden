@@ -79,3 +79,20 @@ class PositionState:
     deployed_usd: float = 0.0
     spent_today_usd: float = 0.0
     held_coins: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class SignalPreferences:
+    """The operator's follow preferences — all optional, None = no preference.
+
+    Loaded from env in agent.py (WARDEN_TICKERS / WARDEN_MIN_CONVICTION /
+    WARDEN_SIDES); invalid values fail closed to absent (None). tickers
+    narrows the book TWICE — the server filters the supply (fewer rows over
+    the wire) and Policy.allowed_coins enforces the intent locally, so a
+    feed-side drift can never widen what the wallet follows. sides values
+    are validated ∈ {"LONG", "SHORT"} at load time.
+    """
+
+    tickers: frozenset[str] | None = None
+    min_conviction: float | None = None
+    sides: frozenset[str] | None = None

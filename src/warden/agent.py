@@ -22,7 +22,7 @@ from .executor import HyperliquidExecutor
 from .ledger import JsonlLedger
 from .policy import AdmitVerdict, PolicyWallet
 from .signals import SignalsUnavailable, VibeSignalProvider
-from .types import Decision, Policy, PositionState, Signal
+from .types import Decision, Policy, PositionState, Signal, SignalPreferences
 
 POLL_SECONDS = 60
 
@@ -215,6 +215,83 @@ def _executor_armed() -> bool:
             and os.getenv("WARDEN_TESTNET_FIRE_TEST") == "pass")
 
 
+# --- your preferences (env-driven, all optional) ------------------------------
+# WARDEN_TICKERS / WARDEN_MIN_CONVICTION / WARDEN_SIDES narrow the book to
+# the operator's slice. Absent = no preference (None). INVALID values fail
+# closed to absent with ONE warning line naming the var — never a crash,
+# never a half-parsed preference.
+
+_PREF_SIDES = ("LONG", "SHORT")
+
+
+def _warn_pref(var: str, raw: str, hint: str) -> None:
+    print(f"[warden] {var}={raw!r} ignored — {hint}", file=sys.stderr)
+
+
+def _pref_tickers(raw: str | None) -> frozenset[str] | None:
+    """WARDEN_TICKERS — comma-separated coin symbols, uppercase-normalized."""
+    if raw is None or not raw.strip():
+        return None
+    tickers = frozenset(t.strip().upper() for t in raw.split(",") if t.strip())
+    if not tickers:
+        _warn_pref("WARDEN_TICKERS", raw, "no coin symbols found")
+        return None
+    return tickers
+
+
+def _pref_min_conviction(raw: str | None) -> float | None:
+    """WARDEN_MIN_CONVICTION — a float in [0, 100]."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        _warn_pref("WARDEN_MIN_CONVICTION", raw, "not a number (0-100)")
+        return None
+    if not (0.0 <= v <= 100.0):
+        _warn_pref("WARDEN_MIN_CONVICTION", raw, "outside 0-100")
+        return None
+    return v
+
+
+def _pref_sides(raw: str | None) -> frozenset[str] | None:
+    """WARDEN_SIDES — comma-separated LONG/SHORT. Invalid tokens are ignored
+    (one warning naming the var); nothing valid → absent."""
+    if raw is None or not raw.strip():
+        return None
+    sides = frozenset(t.strip().upper() for t in raw.split(",") if t.strip())
+    bad = sorted(sides - set(_PREF_SIDES))
+    if bad:
+        _warn_pref("WARDEN_SIDES", raw,
+                   f"invalid side(s) {bad} ignored (LONG/SHORT only)")
+    return (sides & set(_PREF_SIDES)) or None
+
+
+def _load_signal_preferences() -> SignalPreferences:
+    """The three preference env vars → SignalPreferences (all optional)."""
+    return SignalPreferences(
+        tickers=_pref_tickers(os.getenv("WARDEN_TICKERS")),
+        min_conviction=_pref_min_conviction(os.getenv("WARDEN_MIN_CONVICTION")),
+        sides=_pref_sides(os.getenv("WARDEN_SIDES")),
+    )
+
+
+def _pref_side_param(sides: frozenset[str] | None) -> str | None:
+    """frozenset → the SKU's single-side query param. The backend accepts
+    exactly one side (^(LONG|SHORT)$); both sides = no filter — send nothing."""
+    if sides and len(sides) == 1:
+        return next(iter(sides))
+    return None
+
+
+def _pref_tokens_param(tickers: frozenset[str] | None) -> str | None:
+    """frozenset → the SKU's comma-separated tokens param (sorted for a
+    byte-stable query string)."""
+    if not tickers:
+        return None
+    return ",".join(sorted(tickers))
+
+
 def _guided_unavailable(reason: str) -> None:
     """Print the caller-actionable next steps for a priced-feed failure.
 
@@ -387,10 +464,19 @@ async def _main() -> None:
     except NearBrainUnavailable:
         brain = HeuristicBrain(min_conviction=args.min_conviction,
                                size_usd=args.size)
+    # Your preferences wire TWICE (the double gate): the provider sends the
+    # filters server-side (fewer rows over the wire) and the policy refuses
+    # any non-allowlisted coin locally — a feed-side drift can never widen
+    # what the wallet follows. Every other Policy field stays at its default.
+    prefs = _load_signal_preferences()
     agent = Agent(
-        signals=VibeSignalProvider(),
+        signals=VibeSignalProvider(
+            min_conviction=prefs.min_conviction,
+            side=_pref_side_param(prefs.sides),
+            tokens=_pref_tokens_param(prefs.tickers),
+        ),
         brain=brain,
-        policy=PolicyWallet(Policy()),
+        policy=PolicyWallet(Policy(allowed_coins=prefs.tickers)),
     )
     _print_banner()
     if args.mode == "status":

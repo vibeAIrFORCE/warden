@@ -51,6 +51,18 @@ The teeth battery needs NONE of them (`uv run pytest` is network-free); the
 feed needs a trial token or API key; real orders additionally need the
 executor arm ritual below.
 
+#### Your preferences
+
+Narrow the book to your slice — all three are optional:
+
+```bash
+export WARDEN_TICKERS=USELESS,BTC   # only these coins (comma-separated)
+export WARDEN_MIN_CONVICTION=60     # conviction floor (0-100)
+export WARDEN_SIDES=SHORT           # LONG and/or SHORT
+```
+
+The feed returns only your slice; the policy enforces it again locally.
+
 ### Arm the executor
 
 The executor is inert until TWO keys are set, and every dispatch re-checks

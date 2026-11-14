@@ -324,3 +324,64 @@ async def test_vibe_provider_meta_payment_mode_absent_when_unmarked():
     async with _client(handler) as http:
         out = await VibeSignalProvider(http=http).latest()
     assert out[0].meta == {"source": "vibe", "payment_mode": None}
+
+
+# ------------------------------------------------- preference query params
+
+
+def _capture_handler(seen: dict):
+    """Record the request's query params + full URL; answer an empty book."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={
+            "success": True, "data": {"deliveries": [], "count": 0}})
+    return handler
+
+
+async def test_vibe_provider_preference_params_passthrough():
+    """min_conviction / side / tokens ride the query string when set — the
+    backend filters server-side (fewer rows over the wire). The provider is
+    a dumb passthrough: no validation, no defaults beyond status/limit."""
+    seen: dict = {}
+
+    async with _client(_capture_handler(seen)) as http:
+        prov = VibeSignalProvider(base_url="https://mock.test/api", http=http,
+                                  min_conviction=60.0, side="SHORT",
+                                  tokens="USELESS,BTC")
+        await prov.latest()
+
+    assert seen["params"]["min_conviction"] == "60.0"
+    assert seen["params"]["side"] == "SHORT"
+    assert seen["params"]["tokens"] == "USELESS,BTC"
+    assert set(seen["params"]) == {"status", "limit",
+                                   "min_conviction", "side", "tokens"}
+
+
+async def test_vibe_provider_partial_preferences_send_only_set_params():
+    """Only non-None params are sent — a conviction-only preference adds
+    exactly one param and nothing else."""
+    seen: dict = {}
+
+    async with _client(_capture_handler(seen)) as http:
+        prov = VibeSignalProvider(base_url="https://mock.test/api", http=http,
+                                  min_conviction=45.5)
+        await prov.latest()
+
+    assert seen["params"] == {"status": "open", "limit": "25",
+                              "min_conviction": "45.5"}
+
+
+async def test_vibe_provider_no_preferences_url_byte_stable():
+    """No preferences = the exact pre-preferences wire: no extra params and
+    the same URL bytes (dict insertion order keeps status/limit first)."""
+    seen: dict = {}
+
+    async with _client(_capture_handler(seen)) as http:
+        prov = VibeSignalProvider(base_url="https://mock.test/api", http=http,
+                                  limit=7)
+        await prov.latest()
+
+    assert seen["params"] == {"status": "open", "limit": "7"}
+    assert seen["url"] == ("https://mock.test/api/x402/alpha/jev/deliveries"
+                           "?status=open&limit=7")
