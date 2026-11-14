@@ -233,11 +233,14 @@ class NearBrain:
                 await http.aclose()
 
 
-def _refused(kind: str, cause: str) -> Decision:
+def _refused(kind: str, cause: str,
+             probabilities: dict[str, float] | None = None) -> Decision:
     """The fail-closed verdict — follow=False, source nearbrain, the cause
-    named in the reason. Never raises, never allows."""
+    named in the reason. Never raises, never allows. `probabilities` rides
+    along when the three values parsed (the CLI shows the veto's shape;
+    parse/transport refusals carry None)."""
     return Decision(False, reason=f"nearbrain {kind}: {cause}",
-                    source="nearbrain")
+                    source="nearbrain", probabilities=probabilities)
 
 
 def _parse_verdict(content: str, min_margin: float, size_usd: float) -> Decision:
@@ -272,17 +275,19 @@ def _parse_verdict(content: str, min_margin: float, size_usd: float) -> Decision
     margin = ordered[0] - ordered[1]
     if margin < min_margin:
         return _refused(
-            "refused", f"margin {margin:.2f} < min_margin {min_margin}"
+            "refused", f"margin {margin:.2f} < min_margin {min_margin}",
+            probabilities=values,
         )
     top = max(values, key=values.get)  # ties already refused on margin
     if top == "hold":
-        return _refused("refused", "argmax hold — nothing to follow")
+        return _refused("refused", "argmax hold — nothing to follow",
+                        probabilities=values)
     if top == "exit":
         # v1 veto: refuse the ENTRY. Close-execution is out of scope (the
         # executor has no close builder; refusing entries IS the veto).
         return Decision(False,
                         reason=f"nearbrain exit-veto (margin {margin:.2f})",
-                        source="nearbrain")
+                        source="nearbrain", probabilities=values)
     return Decision(True, size_usd=size_usd, leverage=1.0,
                     reason=f"nearbrain enter (margin {margin:.2f})",
-                    source="nearbrain")
+                    source="nearbrain", probabilities=values)

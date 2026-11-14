@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -19,11 +20,107 @@ from .assets import AssetUnresolved
 from .brain import BrainAdapter, HeuristicBrain, NearBrain, NearBrainUnavailable
 from .executor import HyperliquidExecutor
 from .ledger import JsonlLedger
-from .policy import PolicyWallet
+from .policy import AdmitVerdict, PolicyWallet
 from .signals import SignalsUnavailable, VibeSignalProvider
-from .types import Policy, PositionState
+from .types import Decision, Policy, PositionState, Signal
 
 POLL_SECONDS = 60
+
+
+# --- ANSI presentation layer -------------------------------------------------
+# Color is presentation ONLY — no layer reads it. Hard-disabled when NO_COLOR
+# is set, WARDEN_PLAIN=1, or stdout is not a TTY: piped/captured runs stay
+# byte-plain, which keeps README captured-fence outputs honest and pipe-safe.
+_ANSI = {
+    "green": "\033[32m", "amber": "\033[33m", "red": "\033[31m",
+    "dim": "\033[2m", "bold": "\033[1m", "reset": "\033[0m",
+}
+
+
+def _plain() -> bool:
+    if os.getenv("NO_COLOR") is not None or os.getenv("WARDEN_PLAIN") == "1":
+        return True
+    return not sys.stdout.isatty()
+
+
+def _c(code: str, text: str) -> str:
+    """The one colorizer — every colorized print goes through this."""
+    if _plain():
+        return text
+    return f"{_ANSI[code]}{text}{_ANSI['reset']}"
+
+
+# --- decision-line presentation ----------------------------------------------
+# tick() reports as it goes: FOLLOW lines green-bold, nearbrain vetoes and
+# policy refusals print individually in dim, and pure brain-said-no skips are
+# counted — a flood of them becomes one dim summary line after the pass.
+
+def _probabilities_summary(probs: dict) -> tuple[str, float, float]:
+    """(top action, its probability, top1 − top2 margin) from a parsed
+    NearBrain probability dict — presentation only, never a decision."""
+    ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+    (top, p), (_, runner_up) = ranked[0], ranked[1]
+    return top, p, p - runner_up
+
+
+def _decision_line(signal: Signal, decision: Decision,
+                   verdict: AdmitVerdict) -> tuple[str, str]:
+    """Render one outcome's decision line.
+
+    Returns (kind, line) where kind is "follow", "veto" (a nearbrain
+    refusal — always interesting), "policy" (the brain followed and the
+    policy refused) or "counted" (a pure brain-said-no skip — eligible for
+    the end-of-tick counter instead of one print each).
+    """
+    head = f"[warden] {signal.coin} {signal.side}"
+    if verdict.allowed:
+        detail = decision.reason
+        if decision.reason.startswith("nearbrain") and decision.probabilities:
+            who = decision.reason.split(" (")[0]        # "nearbrain enter"
+            top, p, _ = _probabilities_summary(decision.probabilities)
+            detail = f"{who} ({top} {p:.2f})"
+        size = (decision.size_usd if decision.size_usd is not None
+                else verdict.effective_size_usd)
+        coin = _c("bold", _c("green", signal.coin))
+        line = (f"[warden] {coin} {signal.side} FOLLOW — {detail}"
+                f" · ${(size or 0.0):.2f} @ {decision.leverage:g}x")
+        return "follow", line
+    if decision.follow:
+        # the brain followed, the POLICY refused — verdict.reason names the cap
+        return "policy", _c("dim", f"{head} skip — {verdict.reason}")
+    if decision.reason.startswith("nearbrain"):
+        # the veto itself — with parsed probabilities, show its shape
+        if decision.probabilities:
+            top, p, margin = _probabilities_summary(decision.probabilities)
+            detail = f"nearbrain veto ({top} {p:.2f} · margin {margin:.2f})"
+        else:
+            detail = decision.reason
+        return "veto", _c("dim", f"{head} skip — {detail}")
+    return "counted", _c("dim", f"{head} skip — {decision.reason}")
+
+
+def _report_outcome(signal: Signal, decision: Decision, verdict: AdmitVerdict,
+                    counted: list[str]) -> None:
+    """Print one decision line, or buffer it into the skip counter."""
+    kind, line = _decision_line(signal, decision, verdict)
+    if kind == "counted":
+        counted.append(line)
+        return
+    print(line)
+
+
+def _flush_counted_skips(counted: list[str]) -> None:
+    """End-of-tick skip counter — a flood of brain-said-no skips becomes one
+    dim summary; the first three still print individually."""
+    if not counted:
+        return
+    if len(counted) > 3:
+        for line in counted[:3]:
+            print(line)
+        print(_c("dim", f"[warden] · {len(counted)} skipped (signals checked this cycle)"))
+        return
+    for line in counted:
+        print(line)
 
 
 class Agent:
@@ -39,8 +136,14 @@ class Agent:
         self.state = positions or PositionState()
 
     async def tick(self) -> list[dict]:
-        """One pass over the open signals. Returns the per-signal outcomes."""
+        """One pass over the open signals. Returns the per-signal outcomes.
+
+        Decision lines print here (so the poll loop and `--once` report
+        identically): FOLLOW lines, nearbrain vetoes and policy refusals
+        individually, pure brain-said-no skips counted and summarized.
+        """
         outcomes: list[dict] = []
+        counted_skips: list[str] = []
         for signal in await self.signals.latest():
             if self.ledger.seen(signal.signal_id):
                 continue
@@ -70,6 +173,7 @@ class Agent:
                         "dry": _dry(), "exec_reason": "asset_unresolved",
                     })
                     outcomes.append({"signal": signal, "verdict": verdict})
+                    _report_outcome(signal, decision, verdict, counted_skips)
                     continue
                 action = self.executor.build_open(
                     signal.coin, asset=meta.asset, side=signal.side,
@@ -87,6 +191,8 @@ class Agent:
                 "dry": _dry(),
             })
             outcomes.append({"signal": signal, "verdict": verdict})
+            _report_outcome(signal, decision, verdict, counted_skips)
+        _flush_counted_skips(counted_skips)
         return outcomes
 
     async def run(self, poll_seconds: int = POLL_SECONDS) -> None:
@@ -101,6 +207,12 @@ class Agent:
 def _dry() -> bool:
     import os
     return os.getenv("WARDEN_DRY", "1") not in ("0", "false", "off")
+
+
+def _executor_armed() -> bool:
+    import os
+    return (os.getenv("WARDEN_ENABLED") == "1"
+            and os.getenv("WARDEN_TESTNET_FIRE_TEST") == "pass")
 
 
 def _guided_unavailable(reason: str) -> None:
@@ -134,6 +246,20 @@ def _guided_unavailable(reason: str) -> None:
         print(extra, file=sys.stderr)
 
 
+def _print_checklist_line(line: str) -> None:
+    """✓ lines green, · lines dim, → action lines amber kept dim — the
+    body text is untouched; presentation only."""
+    stripped = line.lstrip()
+    if stripped.startswith("✓"):
+        print(_c("green", line))
+    elif stripped.startswith("·"):
+        print(_c("dim", line))
+    elif stripped.startswith("→"):
+        print(_c("dim", _c("amber", line)))
+    else:
+        print(line)
+
+
 def _print_setup_path() -> None:
     """The one-time startup checklist — what's configured, what's next.
     The flow: BRAIN first (NEAR), then SIGNALS (VIBE), then (optionally)
@@ -144,34 +270,106 @@ def _print_setup_path() -> None:
     print("[warden] setup checklist:")
     # 1. BRAIN — the veto decision model
     if os.getenv("WARDEN_BRAIN_URL") and os.getenv("NEAR_API_KEY"):
-        print("  ✓ brain: NearBrain configured (WARDEN_BRAIN_URL + NEAR_API_KEY)")
+        _print_checklist_line(
+            "  ✓ brain: NearBrain configured (WARDEN_BRAIN_URL + NEAR_API_KEY)")
     else:
-        print("  · brain: heuristic fallback (no veto model configured)")
-        print("    → for the Jev veto brain, set TWO vars:")
-        print("        WARDEN_BRAIN_URL=https://cloud-api.near.ai/v1")
-        print("        NEAR_API_KEY=<your NEAR AI Cloud key — cloud-api.near.ai>")
+        _print_checklist_line(
+            "  · brain: heuristic fallback (no veto model configured)")
+        _print_checklist_line("    → for the Jev veto brain, set TWO vars:")
+        _print_checklist_line(
+            "        WARDEN_BRAIN_URL=https://cloud-api.near.ai/v1")
+        _print_checklist_line(
+            "        NEAR_API_KEY=<your NEAR AI Cloud key — cloud-api.near.ai>")
     # 2. SIGNALS — where the follow list comes from
     if os.getenv("VIBE_API_KEY"):
-        print("  ✓ signals: funded VIBE API key (per-call credits)")
+        _print_checklist_line(
+            "  ✓ signals: funded VIBE API key (per-call credits)")
     elif os.getenv("VIBE_TRIAL_TOKEN"):
-        print("  ✓ signals: trial token (free, ~3 calls — then mint another)")
+        _print_checklist_line(
+            "  ✓ signals: trial token (free, ~3 calls — then mint another)")
     else:
-        print("  · signals: NOT configured — the feed will refuse (402)")
-        print("    → free trial (no account):")
-        print("        curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth")
-        print("      then: export VIBE_TRIAL_TOKEN=trial_xxxxxxxxxx   # the WHOLE token")
-        print("    → or a funded key: https://www.vibe.airforce/developers")
+        _print_checklist_line(
+            "  · signals: NOT configured — the feed will refuse (402)")
+        _print_checklist_line("    → free trial (no account):")
+        _print_checklist_line(
+            "        curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth")
+        _print_checklist_line(
+            "      then: export VIBE_TRIAL_TOKEN=trial_xxxxxxxxxx   # the WHOLE token")
+        _print_checklist_line(
+            "    → or a funded key: https://www.vibe.airforce/developers")
     # 3. EXECUTOR — real orders (optional; dry is the default)
-    if os.getenv("WARDEN_ENABLED") == "1" and os.getenv("WARDEN_TESTNET_FIRE_TEST") == "pass":
-        print("  ✓ executor: ARMED (real orders when WARDEN_DRY=0)")
+    if _executor_armed():
+        _print_checklist_line(
+            "  ✓ executor: ARMED (real orders when WARDEN_DRY=0)")
     else:
-        print("  · executor: inert (dry-only) — arm later, see README 'Arm the executor'")
+        _print_checklist_line(
+            "  · executor: inert (dry-only) — arm later, see README 'Arm the executor'")
     print()
+
+
+def _print_banner() -> None:
+    """The identity line — bold version + dim mode tagline, one compact
+    line, printed first (before the DRY banner)."""
+    from . import __version__
+    mode = ("dry mode: decisions print, nothing sends" if _dry()
+            else "live mode: real orders")
+    print(_c("bold", f"WARDEN v{__version__} — policy-capped trading agent")
+          + _c("dim", f"  brain → policy → executor · {mode}"))
+
+
+def _read_ledger_rows(path: Path) -> list[dict]:
+    """Read-only ledger scan for the status screen — never writes."""
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _ledger_row_line(row: dict) -> str:
+    """One compact ledger row for the status screen."""
+    ts = str(row.get("ts", "?"))[:19]
+    word = "FOLLOW" if row.get("decision") is True else "skip"
+    if row.get("executed") is True:
+        state = "executed"
+    elif row.get("dry") is True:
+        state = "dry"
+    else:
+        state = "not-executed"
+    return (f"[warden]   {ts} {row.get('coin', '?')} {row.get('side', '?')}"
+            f" {word} {state}")
+
+
+def _print_status() -> None:
+    """The `status` mode — one read-only screen (checklist, ledger stats,
+    executor arm state), no polling, exit 0."""
+    ledger = JsonlLedger()
+    rows = _read_ledger_rows(ledger._path)   # the ledger's own path, read-only
+    follows = sum(1 for r in rows if r.get("decision") is True)
+    print(_c("dim", f"[warden] ledger: {len(rows)} rows · {follows} FOLLOW"
+                    f" — {ledger._path}"))
+    for row in rows[-3:]:
+        print(_c("dim", _ledger_row_line(row)))
+    if not rows:
+        print(_c("dim", "[warden]   (no rows yet — the ledger fills as signals arrive)"))
+    if _executor_armed():
+        print(_c("green", "[warden] executor arm: ARMED (real orders when WARDEN_DRY=0)"))
+    else:
+        print(_c("dim", "[warden] executor arm: inert (dry-only)"))
 
 
 async def _main() -> None:
     ap = argparse.ArgumentParser(prog="warden")
+    ap.add_argument("mode", nargs="?", choices=("dry", "status"), default="dry",
+                    help="dry = follow loop (default) · "
+                         "status = one read-only screen, no polling")
     ap.add_argument("--dry", action="store_true", default=True)
+    ap.add_argument("--once", action="store_true",
+                    help="run exactly one tick, then exit 0")
     ap.add_argument("--min-conviction", type=float, default=60.0)
     ap.add_argument("--size", type=float, default=10.0)
     ap.add_argument("--poll", type=int, default=POLL_SECONDS)
@@ -194,16 +392,24 @@ async def _main() -> None:
         brain=brain,
         policy=PolicyWallet(Policy()),
     )
+    _print_banner()
+    if args.mode == "status":
+        _print_setup_path()
+        _print_status()
+        return
     if _dry():
         print("[warden] DRY — decisions print, nothing sends")
     _print_setup_path()
+    if args.once:
+        try:
+            await agent.tick()
+        except SignalsUnavailable as exc:
+            # one tick, the same guided honesty as the loop
+            _guided_unavailable(exc.reason)
+        return
     while True:
         try:
-            for out in await agent.tick():
-                v = out["verdict"]
-                s = out["signal"]
-                print(f"[warden] {s.coin} {s.side} "
-                      f"{'FOLLOW' if v.allowed else 'skip'} — {v.reason}")
+            await agent.tick()
         except SignalsUnavailable as exc:
             # Guided presentation only — every other exception still
             # propagates loudly (a real bug must crash). The loop keeps

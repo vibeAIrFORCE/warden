@@ -43,6 +43,12 @@ class Decision:
     follow_size_usd is NOTIONAL (the position size, not margin) — leverage
     multiplies margin efficiency only, so "$25 follow" is a $25 position at
     any leverage.
+
+    `probabilities` is the brain's parsed action probabilities
+    ({"enter", "hold", "exit"} → float in [0, 1]) — filled by NearBrain
+    wherever the three values validated, None when they never parsed
+    (parse/transport refusals). Presentation data only: no layer reads it
+    to decide anything.
     """
 
     follow: bool
@@ -50,6 +56,7 @@ class Decision:
     leverage: float = 1.0
     reason: str = ""
     source: str = "brain"
+    probabilities: Optional[dict] = None
 
 
 @dataclass(frozen=True)

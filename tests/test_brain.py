@@ -16,6 +16,7 @@ from warden.brain import (
     ModelNotReady,
     NearBrain,
     NearBrainUnavailable,
+    _parse_verdict,
 )
 from warden.types import PositionState, Signal
 
@@ -366,3 +367,40 @@ async def test_nearbrain_response_missing_choices_refuses(monkeypatch):
 
     assert d.follow is False
     assert "choices" in d.reason
+
+
+# ------------------------------------------- probabilities ride the Decision
+# The CLI's decision lines read Decision.probabilities (the veto's shape, the
+# enter confidence) — the parse table must fill it wherever the three values
+# validated, and leave it None when they never parsed.
+
+def test_parse_verdict_fills_probabilities_on_enter():
+    d = _parse_verdict(_ENTER, min_margin=0.2, size_usd=10.0)
+    assert d.follow is True
+    assert d.probabilities == {"enter": 0.7, "hold": 0.2, "exit": 0.1}
+
+
+def test_parse_verdict_fills_probabilities_on_veto_paths():
+    hold = _parse_verdict(
+        '{"action":"hold","probabilities":{"enter":0.1,"hold":0.7,"exit":0.2}}',
+        min_margin=0.2, size_usd=10.0)
+    assert hold.follow is False
+    assert hold.probabilities == {"enter": 0.1, "hold": 0.7, "exit": 0.2}
+
+    low = _parse_verdict(
+        '{"action":"enter","probabilities":{"enter":0.45,"hold":0.35,"exit":0.2}}',
+        min_margin=0.2, size_usd=10.0)
+    assert low.follow is False
+    assert low.probabilities is not None and low.probabilities["enter"] == 0.45
+
+    exit_veto = _parse_verdict(
+        '{"action":"exit","probabilities":{"enter":0.1,"hold":0.2,"exit":0.7}}',
+        min_margin=0.2, size_usd=10.0)
+    assert exit_veto.follow is False
+    assert exit_veto.probabilities is not None
+    assert exit_veto.probabilities["exit"] == 0.7
+
+
+def test_parse_verdict_probabilities_stay_none_when_never_parsed():
+    assert _parse_verdict("not json", 0.2, 10.0).probabilities is None
+    assert _parse_verdict('{"action":"enter"}', 0.2, 10.0).probabilities is None
