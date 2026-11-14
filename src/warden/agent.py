@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -99,9 +100,25 @@ def _decision_line(signal: Signal, decision: Decision,
     return "counted", _c("dim", f"{head} skip — {decision.reason}")
 
 
+_brain_401_printed = False   # module latch: the 401 hint prints ONCE
+
+
+def _brain_401_hint(decision: Decision) -> None:
+    """Nearbrain refused with an http 401 — the operator key itself was
+    REJECTED (not absent, not rate-limited). Say so once, plainly, with
+    where to fix it; identical vetoes afterwards stay silent."""
+    global _brain_401_printed
+    if _brain_401_printed or "401" not in decision.reason:
+        return
+    _brain_401_printed = True
+    print(_c("dim", "[warden] NEAR_API_KEY was rejected (401) — check it at "
+                    "cloud-api.near.ai"), file=sys.stderr)
+
+
 def _report_outcome(signal: Signal, decision: Decision, verdict: AdmitVerdict,
                     counted: list[str]) -> None:
     """Print one decision line, or buffer it into the skip counter."""
+    _brain_401_hint(decision)
     kind, line = _decision_line(signal, decision, verdict)
     if kind == "counted":
         counted.append(line)
@@ -127,24 +144,51 @@ class Agent:
     def __init__(self, *, signals, brain: BrainAdapter, policy: PolicyWallet,
                  executor: HyperliquidExecutor | None = None,
                  ledger: JsonlLedger | None = None,
-                 positions: PositionState | None = None) -> None:
+                 positions: PositionState | None = None,
+                 prefs: SignalPreferences | None = None) -> None:
         self.signals = signals
         self.brain = brain
         self.policy = policy
         self.executor = executor
         self.ledger = ledger or JsonlLedger()
         self.state = positions or PositionState()
+        self._prefs = prefs or SignalPreferences()
+
+    def _book_counts(self, fetched: list[Signal]) -> tuple[int, int, int]:
+        """The funnel the status line reports, computed honestly:
+        (fetched, matching prefs locally approximated, above the effective
+        floor). The floor is the operator's pref when set (the server
+        already filtered on it — arrivals below it are drift), else the
+        heuristic brain's floor when that's the brain; no floor → every
+        matched signal counts."""
+        prefs = self._prefs
+        matched = [s for s in fetched
+                   if (prefs.tickers is None or s.coin in prefs.tickers)
+                   and (prefs.sides is None or s.side in prefs.sides)]
+        floor = prefs.min_conviction
+        if floor is None:
+            floor = getattr(self.brain, "min_conviction", None)
+            if not isinstance(floor, (int, float)):
+                floor = None
+        if floor is None:
+            above = matched
+        else:
+            above = [s for s in matched
+                     if s.conviction is not None and s.conviction >= floor]
+        return len(fetched), len(matched), len(above)
 
     async def tick(self) -> list[dict]:
         """One pass over the open signals. Returns the per-signal outcomes.
 
         Decision lines print here (so the poll loop and `--once` report
         identically): FOLLOW lines, nearbrain vetoes and policy refusals
-        individually, pure brain-said-no skips counted and summarized.
+        individually, pure brain-said-no skips counted and summarized —
+        then ONE dim book-status line (always, even on an empty book).
         """
         outcomes: list[dict] = []
         counted_skips: list[str] = []
-        for signal in await self.signals.latest():
+        fetched = list(await self.signals.latest())
+        for signal in fetched:
             if self.ledger.seen(signal.signal_id):
                 continue
             decision = await self.brain.decide(signal, self.state)
@@ -193,6 +237,10 @@ class Agent:
             outcomes.append({"signal": signal, "verdict": verdict})
             _report_outcome(signal, decision, verdict, counted_skips)
         _flush_counted_skips(counted_skips)
+        new_count = len(outcomes)
+        fetched_n, matched_n, above_n = self._book_counts(fetched)
+        print(_c("dim", f"[warden] book: {fetched_n} open · {matched_n} match "
+                        f"prefs · {above_n} above floor · {new_count} new"))
         return outcomes
 
     async def run(self, poll_seconds: int = POLL_SECONDS) -> None:
@@ -292,19 +340,33 @@ def _pref_tokens_param(tickers: frozenset[str] | None) -> str | None:
     return ",".join(sorted(tickers))
 
 
+_guided_printed = False   # module latch: the FULL guidance block prints ONCE
+
+
 def _guided_unavailable(reason: str) -> None:
     """Print the caller-actionable next steps for a priced-feed failure.
 
     SignalsUnavailable is honesty, not a bug — the feed is pay/trial-gated
     and THIS caller's supply failed. Present it as guidance and keep the
     loop alive (the next cycle succeeds once the env var is set).
+
+    Dampened: the FULL block prints ONCE per process; every subsequent
+    failure is one dim line (a 60s poll flooding identical setup steps is
+    noise, not guidance).
     """
+    global _guided_printed
+    if _guided_printed:
+        print(_c("dim", f"[warden] feed still unavailable ({reason}) — "
+                        "see the steps printed above"), file=sys.stderr)
+        return
+    _guided_printed = True
     if reason == "http_402":
         head = "→ mint a FREE trial token (no account needed):"
         extra = "  → or get a funded key: https://www.vibe.airforce/developers"
     elif reason == "http_429":
         head = "→ trial budget exhausted — mint a fresh token (they're capped):"
-        extra = "  → or get a funded key: https://www.vibe.airforce/developers"
+        extra = ("  → or get a funded key: https://www.vibe.airforce/developers\n"
+                 "  → token-frugal alternative: uv run python -m warden.agent --once")
     elif reason == "parse_dropped_all_rows":
         head = "→ payload shape drifted — report this: https://github.com/vibeAIrFORCE/warden"
         extra = ""
@@ -363,7 +425,9 @@ def _print_setup_path() -> None:
             "  ✓ signals: funded VIBE API key (per-call credits)")
     elif os.getenv("VIBE_TRIAL_TOKEN"):
         _print_checklist_line(
-            "  ✓ signals: trial token (free, ~3 calls — then mint another)")
+            "  ✓ signals: trial token (free, ~3 calls — then mint another; "
+            "the loop polls every 60s — each cycle costs one call; ~3 min "
+            "of watching per token)")
     else:
         _print_checklist_line(
             "  · signals: NOT configured — the feed will refuse (402)")
@@ -392,6 +456,32 @@ def _print_banner() -> None:
             else "live mode: real orders")
     print(_c("bold", f"WARDEN v{__version__} — policy-capped trading agent")
           + _c("dim", f"  brain → policy → executor · {mode}"))
+
+
+def _print_ledger_hint(ledger: JsonlLedger) -> None:
+    """The ledger trap, defused at startup: a populated ledger silently eats
+    every already-seen signal — the operator watches a quiet loop and
+    wonders why. One dim line names it and the two ways out."""
+    try:
+        n = sum(1 for _ in _read_ledger_rows(ledger._path))
+    except OSError:
+        return
+    if n > 0:
+        print(_c("dim", f"[warden] ledger: {n} decisions recorded — "
+                        "already-seen signals print nothing; delete the file "
+                        "or run --fresh to re-decide"))
+
+
+def _fresh_ledger(ledger: JsonlLedger) -> bool:
+    """--fresh: rename the ledger to <name>.bak-<epoch> so the loop starts
+    deciding from zero. Returns whether a rename happened."""
+    if not ledger._path.exists():
+        return False
+    backup = ledger._path.with_name(
+        f"{ledger._path.name}.bak-{int(time.time())}")
+    ledger._path.rename(backup)
+    print(f"[warden] ledger moved to {backup.name} — fresh decisions from here")
+    return True
 
 
 def _read_ledger_rows(path: Path) -> list[dict]:
@@ -439,18 +529,101 @@ def _print_status() -> None:
         print(_c("dim", "[warden] executor arm: inert (dry-only)"))
 
 
+# --- --setup: mint a trial token and write it into .env ----------------------
+
+_SETUP_URL = "https://api.vibe.airforce/api/vibe-tools/trial-auth"
+
+
+def _mask_token(token: str) -> str:
+    """trial_<first6>… — the token never prints whole."""
+    return f"trial_{token[6:12]}…"
+
+
+def _write_env_token(env_path: Path, token: str) -> bool:
+    """Append-or-replace VIBE_TRIAL_TOKEN in .env.
+
+    A `VIBE_TRIAL_TOKEN=` line gets its VALUE replaced in place (every
+    other line byte-identical); no such line → appended. A missing file is
+    created with the template's two-line header. Returns True when the
+    file was created fresh."""
+    if env_path.exists():
+        lines = env_path.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("VIBE_TRIAL_TOKEN="):
+                lines[i] = f"VIBE_TRIAL_TOKEN={token}"
+                env_path.write_text("\n".join(lines) + "\n")
+                return False
+        env_path.write_text("\n".join(lines) + "\nVIBE_TRIAL_TOKEN=%s\n" % token)
+        return False
+    env_path.write_text(
+        "# Warden configuration — see .env.example for every field.\n"
+        "VIBE_TRIAL_TOKEN=%s\n" % token)
+    return True
+
+
+async def _run_setup(http=None) -> int:
+    """Mint a trial token, persist it to .env, print the next command."""
+    import httpx
+
+    env_path = Path(os.getenv("WARDEN_ENV_FILE", ".env"))
+    try:
+        own = http is None
+        client = http or httpx.AsyncClient(timeout=15.0)
+        try:
+            res = await client.post(_SETUP_URL)
+        finally:
+            if own:
+                await client.aclose()
+    except (httpx.TransportError, httpx.TimeoutException) as exc:
+        print(f"[warden] trial mint failed: {type(exc).__name__} — try again",
+              file=sys.stderr)
+        return 1
+    if res.status_code != 200:
+        print(f"[warden] trial mint failed: http {res.status_code}",
+              file=sys.stderr)
+        return 1
+    try:
+        token = res.json()["data"]["token"]
+    except (ValueError, KeyError, TypeError):
+        print("[warden] trial mint failed: unexpected response shape",
+              file=sys.stderr)
+        return 1
+    if not (isinstance(token, str) and token.startswith("trial_")):
+        print("[warden] trial mint failed: token missing from response",
+              file=sys.stderr)
+        return 1
+    created = _write_env_token(env_path, token)
+    verb = "created" if created else "updated"
+    print(f"[warden] {env_path} {verb} — VIBE_TRIAL_TOKEN={_mask_token(token)}")
+    print("[warden] next: uv run python -u -m warden.agent --dry")
+    return 0
+
+
 async def _main() -> None:
+    from dotenv import load_dotenv
+    # The cwd .env loads FIRST (override=False): a value already in the real
+    # environment always wins — .env fills the gaps, never clobbers exports.
+    load_dotenv(override=False)
+
     ap = argparse.ArgumentParser(prog="warden")
     ap.add_argument("mode", nargs="?", choices=("dry", "status"), default="dry",
                     help="dry = follow loop (default) · "
                          "status = one read-only screen, no polling")
     ap.add_argument("--dry", action="store_true", default=True)
+    ap.add_argument("--setup", action="store_true",
+                    help="mint a free trial token and write it into .env")
+    ap.add_argument("--fresh", action="store_true",
+                    help="rename the ledger (<name>.bak-<epoch>) and start "
+                         "deciding from zero")
     ap.add_argument("--once", action="store_true",
                     help="run exactly one tick, then exit 0")
     ap.add_argument("--min-conviction", type=float, default=60.0)
     ap.add_argument("--size", type=float, default=10.0)
     ap.add_argument("--poll", type=int, default=POLL_SECONDS)
     args = ap.parse_args()
+
+    if args.setup:
+        raise SystemExit(await _run_setup())
 
     # Construction-time brain selection ONLY: the remote veto brain first
     # (NearBrain, configured via WARDEN_BRAIN_URL), falling back to the
@@ -469,6 +642,7 @@ async def _main() -> None:
     # any non-allowlisted coin locally — a feed-side drift can never widen
     # what the wallet follows. Every other Policy field stays at its default.
     prefs = _load_signal_preferences()
+    ledger = JsonlLedger()
     agent = Agent(
         signals=VibeSignalProvider(
             min_conviction=prefs.min_conviction,
@@ -477,15 +651,20 @@ async def _main() -> None:
         ),
         brain=brain,
         policy=PolicyWallet(Policy(allowed_coins=prefs.tickers)),
+        ledger=ledger,
+        prefs=prefs,
     )
     _print_banner()
     if args.mode == "status":
         _print_setup_path()
         _print_status()
         return
+    if args.fresh:
+        _fresh_ledger(ledger)
     if _dry():
         print("[warden] DRY — decisions print, nothing sends")
     _print_setup_path()
+    _print_ledger_hint(ledger)
     if args.once:
         try:
             await agent.tick()

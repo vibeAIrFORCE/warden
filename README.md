@@ -34,17 +34,29 @@ three-layer verifiable trader:
 uv sync
 uv run pytest -q                       # the teeth, network-free
 
-# the follow loop (dry — prints decisions, sends nothing):
-uv run python -m warden.agent --dry
+# ONE command sets you up — mints a FREE trial token (no account) and
+# writes it into .env for you:
+uv run python -m warden.agent --setup
+
+# then watch the follow loop (dry — prints decisions, sends nothing).
+# -u keeps the banner visible when a timeout/pipe kills the loop:
+uv run python -u -m warden.agent --dry
 ```
+
+Watching costs one trial call per 60s cycle (~3 min per token) — `--once`
+runs a single tick instead. To go past the trial cap, get a funded key at
+[vibe.airforce/developers](https://www.vibe.airforce/developers).
+
+> Manual path: `curl -s -X POST https://api.vibe.airforce/api/vibe-tools/trial-auth | grep -oE 'trial_[a-f0-9]+'` then `export VIBE_TRIAL_TOKEN=<the WHOLE token>` — `--setup` does exactly this for you.
 
 ### Configure
 
-Every key is optional and reads from the environment — copy the template and
-fill what you need (signals trial token first; brain + executor keys later):
+Every key is optional and reads from the environment — `.env` in the repo
+root IS loaded (`--setup` creates/updates it), and real environment
+variables win over `.env` values:
 
 ```bash
-cp .env.example .env    # then edit — every field is documented inline
+cp .env.example .env    # every field documented inline — or let --setup start it
 ```
 
 The teeth battery needs NONE of them (`uv run pytest` is network-free); the
@@ -161,8 +173,8 @@ when SIGTERM lands under a pipe. First-cycle output today:
 [warden] DRY — decisions print, nothing sends
 ```
 
-`FOLLOW` / `skip` lines print here when the feed has open signals — today the
-public feed returns zero usable rows (see Status).
+`FOLLOW` / `skip` lines print here when the feed has open signals — the
+book currently serves live deliveries (real decisions print on cycle one).
 
 ### Prove the executor refuses (network-free, unarmed)
 
