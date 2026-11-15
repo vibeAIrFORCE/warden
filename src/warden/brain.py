@@ -168,7 +168,7 @@ class NearBrain:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str = "z-ai/glm-5.3-flash",
-        timeout: float = 10.0,
+        timeout: float = 30.0,   # real veto calls GENERATE a JSON answer — slower than a ping
         min_margin: float = 0.2,
         size_usd: float = 10.0,
         http: httpx.AsyncClient | None = None,
